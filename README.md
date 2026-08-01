@@ -24,6 +24,14 @@ lsblk -d -o NAME,PATH,SIZE,MODEL,SERIAL,TRAN
 
 ## Requirements
 
+Physical Connection:
+- Plugged into motherboard/HBA
+- USB plug in
+
+> [!INFORMATION]
+> For my testing of SATA and SAS drives, I used external USB options.
+> For SAS, I used "chenyang USB 3.0 to SAS Adapter for 2.5/3.5" SFF-8482 SAS" (with power)
+
 Minimum runtime tools:
 
 - `bash`, `sudo`, `lsblk`, `dd`, `blockdev`, `awk`, `grep`, `sed`, `tr`, `od`, `perl`, `fold`
