@@ -28,7 +28,7 @@ Physical Connection:
 - Plugged into motherboard/HBA
 - USB plug in
 
-> [!INFO]
+> [!NOTE]
 > For my testing of SATA and SAS drives, I used external USB options.
 > For SAS, I used "chenyang USB 3.0 to SAS Adapter for 2.5/3.5" SFF-8482 SAS" (with power)
 
