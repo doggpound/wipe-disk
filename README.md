@@ -1,5 +1,8 @@
 # wipe-disk
 
+> [!WARNING]  
+> This is a script fully generated from AI. Use at your own risk.
+
 Disk wipe utility for USB/SATA devices with:
 
 - Live table-style progress dashboard
