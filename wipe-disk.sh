@@ -2,7 +2,9 @@
 set -euo pipefail
 
 BS="64M"
+DD_DIRECT=0
 LOG_DIR="./logs"
+INTERVAL=1
 DEVICES=()
 
 # Defaults ON
@@ -51,6 +53,8 @@ Options:
   --dry-run-progress
   --dry-run-seconds N
   --dry-run-size-gb N
+  --direct-io
+  --no-direct-io
   --no-verify
   --no-smart
   --no-report
@@ -113,6 +117,20 @@ human_eta() {
     else if (m>0) printf "%dm %02ds",m,ss;
     else printf "%ds",ss;
   }'
+}
+
+human_pct() {
+  local bytes="$1" total="$2"
+  if (( total <= 0 )); then
+    echo "0.00"
+  else
+    awk -v b="$bytes" -v s="$total" 'BEGIN{ printf "%.2f", (b*100/s) }'
+  fi
+}
+
+get_written_sectors() {
+  local devname="$1"
+  awk -v d="$devname" '$3==d {print $10}' /proc/diskstats 2>/dev/null || echo 0
 }
 
 sanitize_name() {
@@ -274,69 +292,92 @@ get_smart_serial_from_file() {
   fi
 }
 
-extract_last_bytes_from_progress() {
-  local progress_file="$1"
-  if [[ -s "$progress_file" ]]; then
-    tr '\r' '\n' < "$progress_file" | awk '/^[[:space:]]*[0-9]+ bytes/ {b=$1} END{if(b=="") print 0; else print b}'
-  else
-    echo 0
-  fi
+draw_progress_table() {
+  local dev="$1" bytes="$2" total_bytes="$3" speed_bps="$4" eta_s="$5" state="$6"
+  local model serial vidpid pct
+
+  model="${DEV_MODEL[$dev]:-unknown}"
+  serial="${DEV_SERIAL[$dev]:-unknown}"
+  vidpid="${DEV_VIDPID[$dev]:-unknown}"
+  pct="$(human_pct "$bytes" "$total_bytes")"
+
+  printf "\033[H\033[2J"
+  echo "Parallel Disk Wipe Dashboard  |  $(date)"
+  echo "Refresh: ${INTERVAL}s   BS: ${BS}   Logs: ${LOG_DIR}"
+  echo "I/O mode: $([[ "$DD_DIRECT" -eq 1 ]] && echo direct-io || echo buffered-io)"
+  echo
+  printf "%-10s %-16s %-14s %-9s %7s %12s %12s %10s %10s\n" "DEVICE" "MODEL" "SERIAL" "VID:PID" "DONE%" "WRITTEN" "SPEED" "ETA" "STATE"
+  printf "%-10s %-16s %-14s %-9s %7s %12s %12s %10s %10s\n" "------" "-----" "------" "-------" "-----" "-------" "-----" "---" "-----"
+  printf "%-10s %-16.16s %-14.14s %-9.9s %6s%% %12s %12s %10s %10s\n" \
+    "$dev" "$model" "$serial" "$vidpid" "$pct" "$(human_bytes "$bytes")" "$(human_bytes "$speed_bps")/s" "$(human_eta "$eta_s")" "$state"
+  echo
+  echo "Ctrl+C will stop ALL running wipes."
 }
 
-pretty_progress_line() {
-  local bytes="$1" total_bytes="$2" elapsed="$3"
-  local speed pct rem eta bar_w done_w todo_w bar
-
-  (( elapsed < 1 )) && elapsed=1
-  speed=$(( bytes / elapsed ))
-
-  if (( total_bytes > 0 )); then
-    pct=$(( bytes * 100 / total_bytes ))
-    (( pct > 100 )) && pct=100
-    rem=$(( total_bytes - bytes ))
-    (( rem < 0 )) && rem=0
-    if (( speed > 0 )); then eta=$(( rem / speed )); else eta=0; fi
-  else
-    pct=0
-    eta=0
-  fi
-
-  bar_w=30
-  done_w=$(( pct * bar_w / 100 ))
-  todo_w=$(( bar_w - done_w ))
-  bar="$(printf '%*s' "$done_w" '' | tr ' ' '#')$(printf '%*s' "$todo_w" '' | tr ' ' '-')"
-
-  printf "\r[%s] %3d%% | %s / %s | %s | ETA %s" \
-    "$bar" "$pct" "$(human_bytes "$bytes")" "$(human_bytes "$total_bytes")" \
-    "$(human_rate_mib "$speed")" "$(human_eta "$eta")"
-}
-
-# Stable progress: uses dd status=progress stream parsing (no USR1 signals)
+# Stable progress with low overhead: diskstats delta + dd status=none
 pretty_progress_dd() {
   local dev="$1" total_bytes="$2" log="$3"
   local dd_pid dd_rc start_ts now elapsed bytes
-  local tmp_progress
+  local dd_oflag
+  local devname base_sect prev_sect cur_sect
+  local last_ts dt inst_delta_sect inst_bps
+  local rem eta_s
 
-  tmp_progress="$(mktemp)"
-  : > "$tmp_progress"
+  if [[ "$DD_DIRECT" -eq 1 ]]; then
+    dd_oflag="oflag=direct"
+  else
+    dd_oflag=""
+  fi
+
+  devname="$(basename "$dev")"
+  base_sect="$(get_written_sectors "$devname")"
+  [[ -z "$base_sect" ]] && base_sect=0
+  prev_sect="$base_sect"
 
   set +e
-  setsid sudo dd if=/dev/zero of="$dev" bs="$BS" oflag=direct status=progress \
-    1>>"$log" 2> >(tee -a "$log" > "$tmp_progress") &
+  setsid sudo dd if=/dev/zero of="$dev" bs="$BS" $dd_oflag status=none >>"$log" 2>&1 &
   dd_pid=$!
   set -e
 
   CURRENT_DD_PID="$dd_pid"
   start_ts=$(date +%s)
+  last_ts="$start_ts"
+  inst_bps=0
+
+  echo "dd mode: bs=${BS} ${dd_oflag:-buffered-io} status=none" >> "$log"
 
   while kill -0 "$dd_pid" 2>/dev/null; do
     sleep 1
-    bytes="$(extract_last_bytes_from_progress "$tmp_progress")"
-    [[ -z "$bytes" ]] && bytes=0
+
+    cur_sect="$(get_written_sectors "$devname")"
+    [[ -z "$cur_sect" ]] && cur_sect="$prev_sect"
+    (( cur_sect < prev_sect )) && cur_sect="$prev_sect"
+
+    bytes=$(( (cur_sect - base_sect) * 512 ))
+    (( bytes < 0 )) && bytes=0
+    (( bytes > total_bytes )) && bytes="$total_bytes"
 
     now=$(date +%s)
     elapsed=$(( now - start_ts ))
-    pretty_progress_line "$bytes" "$total_bytes" "$elapsed"
+
+    dt=$(( now - last_ts ))
+    (( dt <= 0 )) && dt=1
+    inst_delta_sect=$(( cur_sect - prev_sect ))
+    (( inst_delta_sect < 0 )) && inst_delta_sect=0
+    inst_bps=$(( (inst_delta_sect * 512) / dt ))
+
+    rem=$(( total_bytes - bytes ))
+    (( rem < 0 )) && rem=0
+    if (( inst_bps > 0 )); then
+      eta_s=$(( rem / inst_bps ))
+    else
+      eta_s=0
+    fi
+
+    draw_progress_table "$dev" "$bytes" "$total_bytes" "$inst_bps" "$eta_s" "RUNNING"
+
+    prev_sect="$cur_sect"
+    last_ts="$now"
 
     if [[ "$INTERRUPTED" -eq 1 ]]; then
       break
@@ -348,19 +389,23 @@ pretty_progress_dd() {
   dd_rc=$?
   set -e
 
-  LAST_WRITTEN_BYTES="$(extract_last_bytes_from_progress "$tmp_progress")"
-  [[ -z "$LAST_WRITTEN_BYTES" ]] && LAST_WRITTEN_BYTES=0
+  cur_sect="$(get_written_sectors "$devname")"
+  [[ -z "$cur_sect" ]] && cur_sect="$prev_sect"
+  LAST_WRITTEN_BYTES=$(( (cur_sect - base_sect) * 512 ))
+  (( LAST_WRITTEN_BYTES < 0 )) && LAST_WRITTEN_BYTES=0
+  (( LAST_WRITTEN_BYTES > total_bytes )) && LAST_WRITTEN_BYTES="$total_bytes"
 
   CURRENT_DD_PID=""
-  rm -f "$tmp_progress"
+  draw_progress_table "$dev" "$LAST_WRITTEN_BYTES" "$total_bytes" "$inst_bps" 0 "DONE"
   printf "\n"
   return "$dd_rc"
 }
 
 pretty_progress_simulated() {
   local label="$1" total_bytes="$2" duration_sec="$3" log="$4"
-  local start now elapsed bytes
+  local start now elapsed bytes rem eta_s
   local jitter
+  local speed_bps
 
   start=$(date +%s)
   echo "DRY-RUN: simulated wipe started for ${label} (size=$(human_bytes "$total_bytes"), duration=${duration_sec}s)" >> "$log"
@@ -374,7 +419,20 @@ pretty_progress_simulated() {
     bytes=$(( (total_bytes * elapsed / duration_sec) + jitter ))
     (( bytes > total_bytes )) && bytes=$total_bytes
 
-    pretty_progress_line "$bytes" "$total_bytes" "$elapsed"
+    if (( elapsed > 0 )); then
+      speed_bps=$(( bytes / elapsed ))
+    else
+      speed_bps=0
+    fi
+    rem=$(( total_bytes - bytes ))
+    (( rem < 0 )) && rem=0
+    if (( speed_bps > 0 )); then
+      eta_s=$(( rem / speed_bps ))
+    else
+      eta_s=0
+    fi
+
+    draw_progress_table "$label" "$bytes" "$total_bytes" "$speed_bps" "$eta_s" "RUNNING"
     echo "$bytes bytes (simulated progress)" >> "$log"
 
     (( elapsed >= duration_sec )) && break
@@ -386,6 +444,7 @@ pretty_progress_simulated() {
   done
 
   LAST_WRITTEN_BYTES="$bytes"
+  draw_progress_table "$label" "$LAST_WRITTEN_BYTES" "$total_bytes" "$speed_bps" 0 "DONE"
   printf "\n"
 
   if [[ "$INTERRUPTED" -eq 1 ]]; then
@@ -446,6 +505,8 @@ append_smart_embed_for_dev() {
     echo '```'
     echo
   }
+
+  return 0
 }
 
 generate_markdown_report() {
@@ -495,7 +556,7 @@ generate_markdown_report() {
     [[ -n "$pdf" ]] && {
       echo "## PDF"
       echo
-      echo "- \\`${pdf}\\`"
+      printf -- "- \`%s\`\n" "$pdf"
     }
 
     echo "## Self-test checklist"
@@ -570,6 +631,8 @@ while [[ $# -gt 0 ]]; do
     --dry-run-progress) DRY_RUN_PROGRESS=1; NO_WIPE=1; VERIFY=0; SMART=0; shift ;;
     --dry-run-seconds) DRY_RUN_SECONDS="${2:-30}"; shift 2 ;;
     --dry-run-size-gb) DRY_RUN_SIZE_GB="${2:-64}"; shift 2 ;;
+    --direct-io) DD_DIRECT=1; shift ;;
+    --no-direct-io) DD_DIRECT=0; shift ;;
     --no-verify) VERIFY=0; shift ;;
     --no-smart) SMART=0; shift ;;
     --no-report) REPORT=0; shift ;;
