@@ -33,12 +33,14 @@ RUN_CAPTURE_FILE=""
 RUN_CLEAN_FILE=""
 RUN_WRAP_FILE=""
 RUN_PNG_FILE=""
+RUN_PROGRESS_PREFIX=""
 PDF_ENGINE="auto"
 PRIMARY_SERIAL="unknown-serial"
 
 CURRENT_DD_PID=""
 INTERRUPTED=0
 LAST_WRITTEN_BYTES=0
+DASH_FD=3
 
 START_TS="$(date +%Y%m%d-%H%M%S)"
 START_HUMAN="$(date -Is)"
@@ -66,6 +68,15 @@ Options:
   --verify-bs BYTES
   --bs SIZE
 EOF
+}
+
+setup_dashboard_fd() {
+  # Keep high-frequency dashboard redraws out of captured run logs.
+  if [[ -w /dev/tty ]]; then
+    exec 3>/dev/tty
+  else
+    exec 3>&1
+  fi
 }
 
 on_interrupt() {
@@ -131,6 +142,40 @@ human_pct() {
 get_written_sectors() {
   local devname="$1"
   awk -v d="$devname" '$3==d {print $10}' /proc/diskstats 2>/dev/null || echo 0
+}
+
+log_progress_point() {
+  local csv="$1" dev="$2" bytes="$3" total_bytes="$4" speed_bps="$5" eta_s="$6" state="$7"
+  local pct ts
+  pct="$(human_pct "$bytes" "$total_bytes")"
+  ts="$(date -Is)"
+  printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$ts" "$dev" "$bytes" "$total_bytes" "$speed_bps" "$eta_s" "$pct" "$state" >> "$csv"
+}
+
+csv_speed_stats_mib() {
+  local csv="$1"
+  if [[ ! -f "$csv" ]]; then
+    echo "n/a,n/a,n/a,0"
+    return 0
+  fi
+
+  awk -F',' '
+    NR > 1 {
+      s = $5 + 0
+      c++
+      sum += s
+      if (c == 1 || s < min) min = s
+      if (c == 1 || s > max) max = s
+    }
+    END {
+      if (c == 0) {
+        print "n/a,n/a,n/a,0"
+      } else {
+        printf "%.1f MiB/s,%.1f MiB/s,%.1f MiB/s,%d", min/1048576, (sum/c)/1048576, max/1048576, c
+      }
+    }
+  ' "$csv"
 }
 
 sanitize_name() {
@@ -301,22 +346,24 @@ draw_progress_table() {
   vidpid="${DEV_VIDPID[$dev]:-unknown}"
   pct="$(human_pct "$bytes" "$total_bytes")"
 
-  printf "\033[H\033[2J"
-  echo "Parallel Disk Wipe Dashboard  |  $(date)"
-  echo "Refresh: ${INTERVAL}s   BS: ${BS}   Logs: ${LOG_DIR}"
-  echo "I/O mode: $([[ "$DD_DIRECT" -eq 1 ]] && echo direct-io || echo buffered-io)"
-  echo
-  printf "%-10s %-16s %-14s %-9s %7s %12s %12s %10s %10s\n" "DEVICE" "MODEL" "SERIAL" "VID:PID" "DONE%" "WRITTEN" "SPEED" "ETA" "STATE"
-  printf "%-10s %-16s %-14s %-9s %7s %12s %12s %10s %10s\n" "------" "-----" "------" "-------" "-----" "-------" "-----" "---" "-----"
-  printf "%-10s %-16.16s %-14.14s %-9.9s %6s%% %12s %12s %10s %10s\n" \
-    "$dev" "$model" "$serial" "$vidpid" "$pct" "$(human_bytes "$bytes")" "$(human_bytes "$speed_bps")/s" "$(human_eta "$eta_s")" "$state"
-  echo
-  echo "Ctrl+C will stop ALL running wipes."
+  {
+    printf "\033[H\033[2J"
+    echo "Parallel Disk Wipe Dashboard  |  $(date)"
+    echo "Refresh: ${INTERVAL}s   BS: ${BS}   Logs: ${LOG_DIR}"
+    echo "I/O mode: $([[ "$DD_DIRECT" -eq 1 ]] && echo direct-io || echo buffered-io)"
+    echo
+    printf "%-10s %-16s %-14s %-9s %7s %12s %12s %10s %10s\n" "DEVICE" "MODEL" "SERIAL" "VID:PID" "DONE%" "WRITTEN" "SPEED" "ETA" "STATE"
+    printf "%-10s %-16s %-14s %-9s %7s %12s %12s %10s %10s\n" "------" "-----" "------" "-------" "-----" "-------" "-----" "---" "-----"
+    printf "%-10s %-16.16s %-14.14s %-9.9s %6s%% %12s %12s %10s %10s\n" \
+      "$dev" "$model" "$serial" "$vidpid" "$pct" "$(human_bytes "$bytes")" "$(human_bytes "$speed_bps")/s" "$(human_eta "$eta_s")" "$state"
+    echo
+    echo "Ctrl+C will stop ALL running wipes."
+  } >&${DASH_FD}
 }
 
 # Stable progress with low overhead: diskstats delta + dd status=none
 pretty_progress_dd() {
-  local dev="$1" total_bytes="$2" log="$3"
+  local dev="$1" total_bytes="$2" log="$3" progress_csv="$4"
   local dd_pid dd_rc start_ts now elapsed bytes
   local dd_oflag
   local devname base_sect prev_sect cur_sect
@@ -375,6 +422,7 @@ pretty_progress_dd() {
     fi
 
     draw_progress_table "$dev" "$bytes" "$total_bytes" "$inst_bps" "$eta_s" "RUNNING"
+    log_progress_point "$progress_csv" "$dev" "$bytes" "$total_bytes" "$inst_bps" "$eta_s" "RUNNING"
 
     prev_sect="$cur_sect"
     last_ts="$now"
@@ -397,12 +445,13 @@ pretty_progress_dd() {
 
   CURRENT_DD_PID=""
   draw_progress_table "$dev" "$LAST_WRITTEN_BYTES" "$total_bytes" "$inst_bps" 0 "DONE"
-  printf "\n"
+  log_progress_point "$progress_csv" "$dev" "$LAST_WRITTEN_BYTES" "$total_bytes" "$inst_bps" 0 "DONE"
+  printf "\n" >&${DASH_FD}
   return "$dd_rc"
 }
 
 pretty_progress_simulated() {
-  local label="$1" total_bytes="$2" duration_sec="$3" log="$4"
+  local label="$1" total_bytes="$2" duration_sec="$3" log="$4" progress_csv="$5"
   local start now elapsed bytes rem eta_s
   local jitter
   local speed_bps
@@ -433,6 +482,7 @@ pretty_progress_simulated() {
     fi
 
     draw_progress_table "$label" "$bytes" "$total_bytes" "$speed_bps" "$eta_s" "RUNNING"
+    log_progress_point "$progress_csv" "$label" "$bytes" "$total_bytes" "$speed_bps" "$eta_s" "RUNNING"
     echo "$bytes bytes (simulated progress)" >> "$log"
 
     (( elapsed >= duration_sec )) && break
@@ -445,7 +495,8 @@ pretty_progress_simulated() {
 
   LAST_WRITTEN_BYTES="$bytes"
   draw_progress_table "$label" "$LAST_WRITTEN_BYTES" "$total_bytes" "$speed_bps" 0 "DONE"
-  printf "\n"
+  log_progress_point "$progress_csv" "$label" "$LAST_WRITTEN_BYTES" "$total_bytes" "$speed_bps" 0 "DONE"
+  printf "\n" >&${DASH_FD}
 
   if [[ "$INTERRUPTED" -eq 1 ]]; then
     return 130
@@ -559,6 +610,30 @@ generate_markdown_report() {
       printf -- "- \`%s\`\n" "$pdf"
     }
 
+    echo
+    echo "## Progress Timeline Files"
+    echo
+    for d in "${DEVICES[@]}"; do
+      local pfile
+      pfile="${DEV_PROGRESS_FILE[$d]:-}"
+      if [[ -n "$pfile" && -f "$pfile" ]]; then
+        echo "- ${d}: [assets/$(basename "$pfile")](assets/$(basename "$pfile"))"
+      fi
+    done
+
+    echo
+    echo "## Progress Speed Summary"
+    echo
+    echo "| Device | Samples | Min Speed | Avg Speed | Max Speed |"
+    echo "|---|---:|---:|---:|---:|"
+    for d in "${DEVICES[@]}"; do
+      local pfile stats min_s avg_s max_s n_s
+      pfile="${DEV_PROGRESS_FILE[$d]:-}"
+      stats="$(csv_speed_stats_mib "$pfile")"
+      IFS=',' read -r min_s avg_s max_s n_s <<< "$stats"
+      echo "| $d | ${n_s} | ${min_s} | ${avg_s} | ${max_s} |"
+    done
+
     echo "## Self-test checklist"
     echo
     echo "- [ ] Progress UI showed continuous percent, bytes, speed, ETA"
@@ -598,6 +673,23 @@ generate_per_device_report() {
     echo "> Note: On some USB/SATA bridge adapters, SMART serial may differ from host-reported lsblk serial. This is expected when the bridge exposes its own enclosure/controller identifier."
     echo
     append_smart_embed_for_dev "$d" "$assets"
+
+    if [[ -n "${DEV_PROGRESS_FILE[$d]:-}" && -f "${DEV_PROGRESS_FILE[$d]}" ]]; then
+      echo "## Progress Timeline"
+      echo
+      echo "[assets/$(basename "${DEV_PROGRESS_FILE[$d]}")](assets/$(basename "${DEV_PROGRESS_FILE[$d]}"))"
+      echo
+
+      local stats min_s avg_s max_s n_s
+      stats="$(csv_speed_stats_mib "${DEV_PROGRESS_FILE[$d]}")"
+      IFS=',' read -r min_s avg_s max_s n_s <<< "$stats"
+      echo "## Progress Speed Summary"
+      echo
+      echo "| Samples | Min Speed | Avg Speed | Max Speed |"
+      echo "|---:|---:|---:|---:|"
+      echo "| ${n_s} | ${min_s} | ${avg_s} | ${max_s} |"
+      echo
+    fi
 
     echo "## Console (sanitized excerpt)"
     echo
@@ -685,6 +777,7 @@ RUN_CAPTURE_FILE="${ASSETS_DIR}/${PRIMARY_SERIAL}-run-${START_TS}.raw.txt"
 RUN_CLEAN_FILE="${ASSETS_DIR}/${PRIMARY_SERIAL}-run-${START_TS}.clean.txt"
 RUN_WRAP_FILE="${ASSETS_DIR}/${PRIMARY_SERIAL}-run-${START_TS}.wrap.txt"
 RUN_PNG_FILE="${ASSETS_DIR}/${PRIMARY_SERIAL}-run-${START_TS}.png"
+RUN_PROGRESS_PREFIX="${ASSETS_DIR}/${PRIMARY_SERIAL}-progress-${START_TS}"
 
 echo "Reports folder: $RUN_DIR"
 if [[ "$DRY_RUN_PROGRESS" -eq 1 ]]; then
@@ -697,9 +790,11 @@ else
   [[ "$CONFIRM" == "WIPE-ALL" ]] || exit 1
 fi
 
+setup_dashboard_fd
+
 exec > >(tee -a "$RUN_CAPTURE_FILE") 2>&1
 
-declare -A DEV_SIZE DEV_LOG DEV_MODEL DEV_SERIAL DEV_VIDPID DEV_STATE DEV_REASON DEV_WRITTEN_BYTES
+declare -A DEV_SIZE DEV_LOG DEV_MODEL DEV_SERIAL DEV_VIDPID DEV_STATE DEV_REASON DEV_WRITTEN_BYTES DEV_PROGRESS_FILE
 
 for d in "${DEVICES[@]}"; do
   devname="$(basename "$d")"
@@ -719,6 +814,10 @@ for d in "${DEVICES[@]}"; do
   fi
 
   DEV_WRITTEN_BYTES["$d"]=0
+  DEV_PROGRESS_FILE["$d"]="${ASSETS_DIR}/$(safe_serial_for_name "$d")-progress-$(sanitize_name "$(basename "$d")")-${START_TS}.csv"
+  {
+    echo "timestamp,device,bytes_written,total_bytes,speed_bps,eta_seconds,percent,state"
+  } > "${DEV_PROGRESS_FILE[$d]}"
 
   echo "[$d] model=${DEV_MODEL[$d]} serial=${DEV_SERIAL[$d]} vidpid=${DEV_VIDPID[$d]} size=$(human_bytes "${DEV_SIZE[$d]}")"
 
@@ -734,7 +833,7 @@ for d in "${DEVICES[@]}"; do
   if [[ "$DRY_RUN_PROGRESS" -eq 1 ]]; then
     echo "Simulating wipe UI for $d ..."
     set +e
-    pretty_progress_simulated "$d" "${DEV_SIZE[$d]}" "$DRY_RUN_SECONDS" "$log"
+    pretty_progress_simulated "$d" "${DEV_SIZE[$d]}" "$DRY_RUN_SECONDS" "$log" "${DEV_PROGRESS_FILE[$d]}"
     sim_rc=$?
     set -e
 
@@ -758,7 +857,7 @@ for d in "${DEVICES[@]}"; do
 
   echo "Wiping $d ..."
   set +e
-  pretty_progress_dd "$d" "${DEV_SIZE[$d]}" "$log"
+  pretty_progress_dd "$d" "${DEV_SIZE[$d]}" "$log" "${DEV_PROGRESS_FILE[$d]}"
   dd_rc=$?
   set -e
 
